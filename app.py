@@ -7,6 +7,7 @@ from datetime import datetime, date
 
 import pandas as pd
 import pdfplumber
+import fitz  # PyMuPDF
 import streamlit as st
 
 
@@ -224,6 +225,146 @@ def extrair_atividades(arquivos_pdf):
             })
 
     return pd.DataFrame(dados_extraidos)
+
+
+# ============================================================
+# EXTRAÇÃO: COMENTÁRIOS DO RDO
+# ============================================================
+
+RE_DATA_RDO_COMENTARIOS = [
+    re.compile(r"Data\s+do\s+relat[oó]rio\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", re.I),
+    re.compile(r"Relat[oó]rio\s+(\d{2}/\d{2}/\d{4})\s+n[°ºo]?", re.I),
+]
+
+RE_INICIO_COMENTARIOS = re.compile(
+    r"^\s*Coment[aá]rios\s*\(\s*\d+\s*\)\s*$",
+    re.I | re.M,
+)
+
+RE_FIM_COMENTARIOS = re.compile(
+    r"^\s*(?:Fotos|Assinaturas|Anexos|Observa[cç][oõ]es|Ocorr[eê]ncias)\s*(?:\(\s*\d+\s*\))?\s*$",
+    re.I | re.M,
+)
+
+RE_METADADO_AUTOR_COMENTARIO = re.compile(
+    r"^\s*[^\n]{1,80}?\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*$",
+    re.M,
+)
+
+RE_NOTA_COMENTARIO = re.compile(
+    r"(?ms)^\s*(Nota\s*\d+\s*:\s*.*?)(?=^\s*Nota\s*\d+\s*:|\Z)",
+    re.I,
+)
+
+
+def normalizar_texto_comentarios(texto):
+    texto = texto.replace("\u00a0", " ").replace("\r", "\n")
+    texto = re.sub(r"(?<=\w)-\n(?=\w)", "", texto)
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
+
+def extrair_texto_pdf_comentarios(arquivo):
+    resetar_arquivo(arquivo)
+    conteudo = arquivo.read()
+    resetar_arquivo(arquivo)
+
+    partes = []
+    with fitz.open(stream=conteudo, filetype="pdf") as pdf:
+        for pagina in pdf:
+            partes.append(pagina.get_text("text", sort=True) or "")
+
+    return normalizar_texto_comentarios("\n".join(partes))
+
+
+def extrair_data_rdo_comentarios(texto, nome_arquivo):
+    for padrao in RE_DATA_RDO_COMENTARIOS:
+        achado = padrao.search(texto)
+        if achado:
+            return achado.group(1)
+
+    achado = re.search(r"(\d{2})[-_](\d{2})[-_](\d{4})", nome_arquivo)
+    if achado:
+        return f"{achado.group(1)}/{achado.group(2)}/{achado.group(3)}"
+
+    return "Data não encontrada"
+
+
+def extrair_secao_comentarios(texto):
+    inicio = RE_INICIO_COMENTARIOS.search(texto)
+    if not inicio:
+        return ""
+
+    restante = texto[inicio.end():]
+    fim = RE_FIM_COMENTARIOS.search(restante)
+    if fim:
+        restante = restante[:fim.start()]
+
+    restante = re.sub(
+        r"^\s*Relat[oó]rio\s+\d{2}/\d{2}/\d{4}\s+n[°ºo]?\s*\d+\s*$",
+        "",
+        restante,
+        flags=re.I | re.M,
+    )
+    restante = re.sub(r"^\s*\d+\s*/\s*\d+\s*$", "", restante, flags=re.M)
+    return restante.strip()
+
+
+def limpar_comentario_rdo(texto):
+    texto = RE_METADADO_AUTOR_COMENTARIO.sub("", texto)
+    texto = re.sub(r"\s*\n\s*", " ", texto)
+    texto = re.sub(r"\s{2,}", " ", texto)
+    return texto.strip(" -\n\t")
+
+
+def extrair_lista_comentarios(texto):
+    secao = extrair_secao_comentarios(texto)
+    if not secao:
+        return []
+
+    notas = [
+        limpar_comentario_rdo(match.group(1))
+        for match in RE_NOTA_COMENTARIO.finditer(secao)
+    ]
+    notas = [nota for nota in notas if nota]
+    if notas:
+        return notas
+
+    blocos = RE_METADADO_AUTOR_COMENTARIO.split(secao)
+    comentarios = [limpar_comentario_rdo(bloco) for bloco in blocos]
+    return [comentario for comentario in comentarios if comentario]
+
+
+def extrair_comentarios_rdo(arquivos_pdf):
+    dados = []
+
+    for arquivo in arquivos_pdf:
+        nome_arquivo = obter_nome_arquivo(arquivo)
+
+        try:
+            texto = extrair_texto_pdf_comentarios(arquivo)
+            data_rdo = extrair_data_rdo_comentarios(texto, nome_arquivo)
+            comentarios = extrair_lista_comentarios(texto)
+
+            for comentario in comentarios:
+                dados.append({
+                    "Data do RDO": data_rdo,
+                    "Comentário": comentario,
+                    "Nome do arquivo": nome_arquivo,
+                })
+
+        except Exception as e:
+            dados.append({
+                "Data do RDO": "Erro",
+                "Comentário": f"Erro ao processar arquivo: {e}",
+                "Nome do arquivo": nome_arquivo,
+            })
+
+    return pd.DataFrame(
+        dados,
+        columns=["Data do RDO", "Comentário", "Nome do arquivo"]
+    )
 
 
 # ============================================================
@@ -800,6 +941,7 @@ tipo_extracao = st.radio(
     [
         "Mão de obra e equipamentos",
         "Atividades",
+        "Comentários do RDO",
         "Comparativo programação semanal x RDO"
     ]
 )
@@ -956,9 +1098,12 @@ else:
                 if tipo_extracao == "Mão de obra e equipamentos":
                     df = extrair_mao_obra_e_equipamentos(arquivos_pdf)
                     nome_arquivo = "consolidado_mao_obra_e_equipamentos.xlsx"
-                else:
+                elif tipo_extracao == "Atividades":
                     df = extrair_atividades(arquivos_pdf)
                     nome_arquivo = "0799_atividades_rdo.xlsx"
+                else:
+                    df = extrair_comentarios_rdo(arquivos_pdf)
+                    nome_arquivo = "0799_comentarios_rdo.xlsx"
 
             if df.empty:
                 st.warning("Nenhum dado foi encontrado nos PDFs enviados.")
