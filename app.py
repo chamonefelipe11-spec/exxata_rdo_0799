@@ -236,6 +236,11 @@ RE_DATA_RDO_COMENTARIOS = [
     re.compile(r"Relat[oó]rio\s+(\d{2}/\d{2}/\d{4})\s+n[°ºo]?", re.I),
 ]
 
+RE_NUMERO_RDO_COMENTARIOS = [
+    re.compile(r"Relat[oó]rio(?:\s+\d{2}/\d{2}/\d{4})?\s+n[°ºo]?\s*(\d+)", re.I),
+    re.compile(r"Relat[oó]rio\s+n[°ºo]?\s*(\d+)", re.I),
+]
+
 RE_INICIO_COMENTARIOS = re.compile(
     r"^\s*Coment[aá]rios\s*\(\s*\d+\s*\)\s*$",
     re.I | re.M,
@@ -247,14 +252,27 @@ RE_FIM_COMENTARIOS = re.compile(
 )
 
 RE_METADADO_AUTOR_COMENTARIO = re.compile(
-    r"^\s*[^\n]{1,80}?\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*$",
+    r"^\s*([^\n]{1,80}?)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s*$",
     re.M,
 )
 
 RE_NOTA_COMENTARIO = re.compile(
-    r"(?ms)^\s*(Nota\s*\d+\s*:\s*.*?)(?=^\s*Nota\s*\d+\s*:|\Z)",
+    r"(?ms)^\s*(Nota\s*\d+\s*:\s*.*?)(?=^\s*[^\n]{1,80}?\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*$|^\s*Nota\s*\d+\s*:|\Z)",
     re.I,
 )
+
+PALAVRAS_IMPACTO_COMENTARIO = {
+    "impacto", "impactada", "impactado", "impactadas", "impactados",
+    "atraso", "atrasada", "atrasado", "paralisação", "paralisacao",
+    "paralisada", "paralisado", "impedimento", "impedido", "impedida",
+    "restrição", "restricao", "indisponibilidade", "liberação parcial",
+    "liberacao parcial", "ociosidade", "excedente", "remanejado",
+    "remanejada", "chuva", "chuvas", "descargas atmosféricas",
+    "descargas atmosfericas", "não liberação", "nao liberacao",
+    "sem frente", "frentes alternativas", "recuperar o avanço",
+    "recuperar o avanco", "prejudic", "compromet", "interferência",
+    "interferencia", "desvio", "reprogram", "suspensão", "suspensao",
+}
 
 
 def normalizar_texto_comentarios(texto):
@@ -291,6 +309,61 @@ def extrair_data_rdo_comentarios(texto, nome_arquivo):
     return "Data não encontrada"
 
 
+def extrair_numero_rdo_comentarios(texto, nome_arquivo):
+    for padrao in RE_NUMERO_RDO_COMENTARIOS:
+        achado = padrao.search(texto)
+        if achado:
+            return achado.group(1)
+
+    achado = re.search(r"(?:RDO|n|nº|n°)[ _-]*(\d+)", nome_arquivo, re.I)
+    if achado:
+        return achado.group(1)
+
+    return "Nº não encontrado"
+
+
+def extrair_dia_semana_comentarios(texto):
+    achado = re.search(
+        r"Dia\s+da\s+semana\s*[:\-]?\s*([A-Za-zÀ-ÿ-]+)",
+        texto,
+        flags=re.I,
+    )
+    return limpar_celula(achado.group(1)) if achado else ""
+
+
+def extrair_clima_comentarios(texto):
+    registros = []
+    padrao = re.compile(
+        r"\b(Manhã|Tarde|Noite)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ \/-]*?)\s+(Praticável|Impraticável)\b",
+        flags=re.I,
+    )
+
+    for achado in padrao.finditer(texto):
+        registros.append({
+            "turno": limpar_celula(achado.group(1)).title(),
+            "tempo": limpar_celula(achado.group(2)),
+            "condicao": limpar_celula(achado.group(3)).title(),
+        })
+
+    pluviometria = ""
+    bloco_clima = re.search(
+        r"Condi[cç][aã]o\s+clim[aá]tica(.*?)(?:M[aã]o\s+de\s+obra|Equipamentos|Atividades)",
+        texto,
+        flags=re.I | re.S,
+    )
+    texto_busca = bloco_clima.group(1) if bloco_clima else texto
+    achado_mm = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*mm\b", texto_busca, flags=re.I)
+    if achado_mm:
+        pluviometria = achado_mm.group(1).replace(",", ".")
+
+    return {
+        "Turno": "; ".join(item["turno"] for item in registros),
+        "Tempo": "; ".join(item["tempo"] for item in registros),
+        "Condição": "; ".join(item["condicao"] for item in registros),
+        "Pluviometria (mm)": pluviometria,
+    }
+
+
 def extrair_secao_comentarios(texto):
     inicio = RE_INICIO_COMENTARIOS.search(texto)
     if not inicio:
@@ -318,26 +391,60 @@ def limpar_comentario_rdo(texto):
     return texto.strip(" -\n\t")
 
 
+def classificar_comentario_rdo(comentario):
+    comentario_normalizado = normalizar_texto(comentario)
+    for termo in PALAVRAS_IMPACTO_COMENTARIO:
+        if normalizar_texto(termo) in comentario_normalizado:
+            return "IMPACTO"
+    return "INFORMAÇÃO"
+
+
 def extrair_lista_comentarios(texto):
     secao = extrair_secao_comentarios(texto)
     if not secao:
         return []
 
+    metadados = list(RE_METADADO_AUTOR_COMENTARIO.finditer(secao))
+    resultados = []
+
+    if metadados:
+        for indice, meta in enumerate(metadados):
+            inicio = meta.end()
+            fim = metadados[indice + 1].start() if indice + 1 < len(metadados) else len(secao)
+            comentario = limpar_comentario_rdo(secao[inicio:fim])
+            if comentario:
+                resultados.append({
+                    "responsavel": limpar_celula(meta.group(1)),
+                    "comentario": comentario,
+                })
+        return resultados
+
     notas = [
         limpar_comentario_rdo(match.group(1))
         for match in RE_NOTA_COMENTARIO.finditer(secao)
     ]
-    notas = [nota for nota in notas if nota]
-    if notas:
-        return notas
-
-    blocos = RE_METADADO_AUTOR_COMENTARIO.split(secao)
-    comentarios = [limpar_comentario_rdo(bloco) for bloco in blocos]
-    return [comentario for comentario in comentarios if comentario]
+    return [
+        {"responsavel": "", "comentario": nota}
+        for nota in notas
+        if nota
+    ]
 
 
 def extrair_comentarios_rdo(arquivos_pdf):
     dados = []
+    colunas = [
+        "nº RDO",
+        "Data",
+        "Responsável pelo Comentário",
+        "Classificação",
+        "Dia",
+        "Turno",
+        "Tempo",
+        "Condição",
+        "Pluviometria (mm)",
+        "Comentário",
+        "Nome do arquivo",
+    ]
 
     for arquivo in arquivos_pdf:
         nome_arquivo = obter_nome_arquivo(arquivo)
@@ -345,26 +452,43 @@ def extrair_comentarios_rdo(arquivos_pdf):
         try:
             texto = extrair_texto_pdf_comentarios(arquivo)
             data_rdo = extrair_data_rdo_comentarios(texto, nome_arquivo)
+            numero_rdo = extrair_numero_rdo_comentarios(texto, nome_arquivo)
+            dia_semana = extrair_dia_semana_comentarios(texto)
+            clima = extrair_clima_comentarios(texto)
             comentarios = extrair_lista_comentarios(texto)
 
-            for comentario in comentarios:
+            for item in comentarios:
+                comentario = item["comentario"]
                 dados.append({
-                    "Data do RDO": data_rdo,
+                    "nº RDO": numero_rdo,
+                    "Data": data_rdo,
+                    "Responsável pelo Comentário": item["responsavel"],
+                    "Classificação": classificar_comentario_rdo(comentario),
+                    "Dia": dia_semana,
+                    "Turno": clima["Turno"],
+                    "Tempo": clima["Tempo"],
+                    "Condição": clima["Condição"],
+                    "Pluviometria (mm)": clima["Pluviometria (mm)"],
                     "Comentário": comentario,
                     "Nome do arquivo": nome_arquivo,
                 })
 
         except Exception as e:
             dados.append({
-                "Data do RDO": "Erro",
+                "nº RDO": "Erro",
+                "Data": "Erro",
+                "Responsável pelo Comentário": "",
+                "Classificação": "",
+                "Dia": "",
+                "Turno": "",
+                "Tempo": "",
+                "Condição": "",
+                "Pluviometria (mm)": "",
                 "Comentário": f"Erro ao processar arquivo: {e}",
                 "Nome do arquivo": nome_arquivo,
             })
 
-    return pd.DataFrame(
-        dados,
-        columns=["Data do RDO", "Comentário", "Nome do arquivo"]
-    )
+    return pd.DataFrame(dados, columns=colunas)
 
 
 # ============================================================
